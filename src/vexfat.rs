@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs,
-    io::{self, Read, Seek},
+    io::{self, Read, Seek, Write}, path::MAIN_SEPARATOR_STR,
 };
 
 use vexfatbd::VirtualExFatBlockDevice;
@@ -139,7 +139,7 @@ impl VexFat {
             }
 
             let relative = relative_path_from_common_root(&root, &path);
-            println!(" - ro:vexfat:{}/{}", prefix, relative.display());
+            println!(" - ro:vexfat:{}{}{}", prefix, MAIN_SEPARATOR_STR, relative.display());
         }
 
         println!("Emulating read-only exFAT block device");
