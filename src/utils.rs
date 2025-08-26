@@ -6,7 +6,11 @@ pub fn unsigned_rounded_up_div<T>(a: T, b: T) -> T
 where
     T: num_traits::Unsigned,
 {
-    a.sub(T::one()).div(b).add(T::one())
+    if a == T::zero() {
+        T::zero()
+    } else {
+        a.sub(T::one()).div(b).add(T::one())
+    }
 }
 
 pub fn unsigned_align_to<T>(a: T, b: T) -> T

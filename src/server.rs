@@ -186,11 +186,17 @@ impl Server {
         let size = req.block_type.blocks_size();
         let data = &req.data[..size];
 
+        println!("WRITE_RDMA: {} bytes from {}", size, addr);
+
         #[allow(clippy::collapsible_if)]
         if self.write_rdma_valid {
-            if self.block_device.write(data).is_err() {
-                eprintln!("Failed to write data to block device");
+            if let Err(err) = self.block_device.write(data) {
+                eprintln!("Failed to write data to block device: {}", err);
+            } else {
+                println!("Successfully wrote {} bytes", size);
             }
+        } else {
+            println!("Write RDMA not valid, skipping write");
         }
 
         match self.write_size_left.checked_sub(size) {
@@ -202,6 +208,11 @@ impl Server {
         }
 
         if self.write_size_left == 0 {
+            println!("Write sequence complete, flushing cache");
+            if let Err(err) = self.block_device.flush_writes() {
+                eprintln!("Failed to flush writes: {}", err);
+            }
+
             let reply = WriteReply {
                 header: Header::new_with_raw_value(0)
                     .with_command(Command::WriteDone)
