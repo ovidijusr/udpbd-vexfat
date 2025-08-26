@@ -168,12 +168,18 @@ impl Server {
             sector_count
         );
 
+        // Reset per-request write tracking
         self.write_size_left =
             usize::from(sector_count) * usize::from(self.block_device.sector_size());
 
-        match self.block_device.seek(sector_nr) {
+    // Reset per-write sequence state so file offsets start at 0 for new files
+    self.block_device.begin_write_sequence();
+
+    match self.block_device.seek(sector_nr) {
             Ok(_) => {
                 self.write_rdma_valid = true;
+                // Also reset intra-sector offset so RDMA writes start cleanly for this request
+                // The VexFat layer maintains per-file sequential offsets for the target path.
             }
             Err(err) => {
                 eprintln!("Failed to seek to sector {sector_nr}: {err}");
@@ -186,27 +192,32 @@ impl Server {
         let size = req.block_type.blocks_size();
         let data = &req.data[..size];
 
-        #[allow(clippy::collapsible_if)]
-        if self.write_rdma_valid {
-            if self.block_device.write(data).is_err() {
-                eprintln!("Failed to write data to block device");
-            }
+        println!("WRITE_RDMA: {} bytes from {}", size, addr);
+
+        // Only process RDMA if a write request has primed the state
+        if !self.write_rdma_valid {
+            println!("Write RDMA not valid, ignoring packet (no active write)");
+            return;
         }
 
-        match self.write_size_left.checked_sub(size) {
-            Some(new_size) => self.write_size_left = new_size,
-            None => {
-                eprintln!("write_size_left wraparound at 0");
-                self.write_size_left = 0;
-            }
+        if let Err(err) = self.block_device.write(data) {
+            eprintln!("Failed to write data to block device: {}", err);
+        } else {
+            println!("Successfully wrote {} bytes", size);
         }
 
-        if self.write_size_left == 0 {
+        // Track remaining bytes for this write sequence
+        self.write_size_left = self
+            .write_size_left
+            .saturating_sub(size);
+
+        if self.write_size_left == 0 && self.write_rdma_valid {
+            // Complete this write request quickly to avoid client timeout
             let reply = WriteReply {
                 header: Header::new_with_raw_value(0)
                     .with_command(Command::WriteDone)
                     .with_command_id(req.header.command_id())
-                    .with_command_pkt(req.header.command_id().value() + 1), // ?
+            .with_command_pkt(1),
                 result: 0,
             };
             let ser = bytemuck::bytes_of(&reply);
@@ -214,6 +225,15 @@ impl Server {
             if let Err(err) = self.socket.send_to(ser, addr) {
                 eprintln!("Failed to reply with UDPBD_CMD_WRITE_DONE to {addr}: {err}");
             };
+
+            // Finalize new files into the virtual filesystem so reads see them
+            if let Err(err) = self.block_device.flush_writes() {
+                eprintln!("Warning: flush_writes failed: {}", err);
+            }
+
+            // Reset write sequence state
+            self.write_rdma_valid = false;
+            self.write_size_left = 0;
         }
     }
 }
