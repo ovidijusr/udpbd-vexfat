@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf, MAIN_SEPARATOR_STR},
 };
 
-use vexfatbd::VirtualExFatBlockDevice;
+use vexfatbd::{VirtualExFatBlockDevice, heap::DirectoryEntry, data_region::file::FileNameDirectoryEntry};
 use walkdir::WalkDir;
 
 use crate::{
@@ -15,6 +15,7 @@ use crate::{
 };
 
 const BYTES_PER_SECTOR_SHIFT: u8 = 9; // 512 bytes
+const SECTORS_PER_FILE: u32 = 400; // 200KB generous allocation per file
 
 #[derive(Debug)]
 pub enum WriteError {
@@ -49,6 +50,11 @@ pub struct VexFat {
     current_write_sector: u32,
     current_write_offset_in_sector: u32,
     
+    // Directory entry parsing for filename extraction
+    sector_to_filename: HashMap<u32, String>, // Persistent sector -> filename mapping
+    directory_entry_buffer: Vec<u8>,
+    next_available_sector: u32, // Track next sector to allocate for new files
+    
     // Directory cluster mapping for virtual filesystem integration
     dir_to_cluster: HashMap<PathBuf, u32>,
     
@@ -60,6 +66,182 @@ pub struct VexFat {
 }
 
 impl VexFat {
+    /// Parse directory entries to extract filenames from FileNameDirectoryEntry structures
+    fn parse_directory_entries(&mut self, data: &[u8]) {
+        println!("=== PARSING DIRECTORY ENTRIES ===");
+        println!("Input data: {} bytes", data.len());
+        println!("Raw data (first 128 bytes): {:02x?}", &data[0..std::cmp::min(128, data.len())]);
+        
+        // Add data to the buffer
+        self.directory_entry_buffer.extend_from_slice(data);
+        println!("Buffer now contains {} bytes", self.directory_entry_buffer.len());
+        
+        // Directory entries are 32 bytes each
+        let mut entry_count = 0;
+        while self.directory_entry_buffer.len() >= 32 {
+            let entry_bytes = &self.directory_entry_buffer[0..32];
+            entry_count += 1;
+            
+            // Skip empty entries (all zeros) - these cause spam
+            if entry_bytes.iter().all(|&b| b == 0) {
+                self.directory_entry_buffer.drain(0..32);
+                continue;
+            }
+            
+            // Try to parse as directory entry
+            if let Some(entry) = DirectoryEntry::new_from_bytes(entry_bytes) {
+                match entry {
+                    DirectoryEntry::FileName(file_name_entry) => {
+                        // Extract filename from FileNameDirectoryEntry  
+                        let filename = Self::extract_filename_from_entry(&file_name_entry);
+                        if !filename.is_empty() {
+                            println!("ALLOCATING SECTOR BLOCK FOR FILENAME: {}", filename);
+                            self.allocate_sector_block_for_file(&filename);
+                        }
+                    }
+                    DirectoryEntry::File(_) => {
+                        // File entry found
+                    }
+                    DirectoryEntry::StreamExtension(_) => {
+                        // Stream extension found
+                    }
+                    DirectoryEntry::VolumeLabel(_) => {
+                        println!("Found VolumeLabel directory entry");
+                    }
+                    DirectoryEntry::AllocationBitmap(_) => {
+                        println!("Found AllocationBitmap directory entry");
+                    }
+                    DirectoryEntry::UpcaseTable(_) => {
+                        println!("Found UpcaseTable directory entry");
+                    }
+                    _ => {
+                        // Other entry types
+                    }
+                }
+            }
+            
+            // Remove processed entry from buffer
+            self.directory_entry_buffer.drain(0..32);
+        }
+        
+        println!("Finished processing {} directory entries", entry_count);
+        println!("Remaining buffer: {} bytes", self.directory_entry_buffer.len());
+        println!("Sector-to-filename mappings: {}", self.sector_to_filename.len());
+        println!("=== END DIRECTORY ENTRY PARSING ===\n");
+    }
+    
+    /// Extract filename string from FileNameDirectoryEntry
+    fn extract_filename_from_entry(entry: &FileNameDirectoryEntry) -> String {
+        // Convert UTF-16 filename to UTF-8 string
+        let filename_chars: Vec<u16> = entry.file_name
+            .iter()
+            .take_while(|&&c| c != 0) // Stop at null terminator
+            .copied()
+            .collect();
+        
+        String::from_utf16(&filename_chars).unwrap_or_default()
+    }
+
+    /// Allocate a block of sectors for a filename (400 sectors = 200KB)
+    fn allocate_sector_block_for_file(&mut self, filename: &str) {
+        let start_sector = self.next_available_sector;
+        let end_sector = start_sector + SECTORS_PER_FILE;
+        
+        println!("=== ALLOCATING SECTOR BLOCK ===");
+        println!("Filename: {}", filename);
+        println!("Sector range: {} - {}", start_sector, end_sector - 1);
+        println!("Size: {} sectors ({} KB)", SECTORS_PER_FILE, SECTORS_PER_FILE / 2);
+        
+        // Map all sectors in the block to this filename
+        for sector in start_sector..end_sector {
+            self.sector_to_filename.insert(sector, filename.to_string());
+        }
+        
+        // Update next available sector
+        self.next_available_sector = end_sector;
+        
+        println!("Next available sector: {}", self.next_available_sector);
+        println!("=== END SECTOR ALLOCATION ===\n");
+    }
+
+    /// Get filename for a specific sector
+    fn get_filename_for_sector(&self, sector: u32) -> Option<&String> {
+        self.sector_to_filename.get(&sector)
+    }
+
+    /// Determine filename from write context and data preview
+    fn determine_filename_from_context(&self, lookahead: &[u8]) -> String {
+        // Content-based filename detection
+        if lookahead.len() >= 4 {
+            match &lookahead[0..4] {
+                b"NIDC" => return "cache.bin".to_string(),
+                b"---\n" | b"#---" => return "global.yaml".to_string(), // YAML header
+                _ => {}
+            }
+        }
+        
+        // Check for YAML content patterns
+        if lookahead.len() >= 10 {
+            let content_str = String::from_utf8_lossy(lookahead);
+            if content_str.contains("yaml") || content_str.contains("config") {
+                return "global.yaml".to_string();
+            }
+        }
+        
+        // Binary data might be lastTitle.bin
+        if lookahead.len() >= 8 && lookahead.iter().any(|&b| b == 0) {
+            return "lastTitle.bin".to_string();
+        }
+        
+        // Fallback sequential naming
+        "nhddl_file.bin".to_string()
+    }
+
+    /// Create a file dynamically during write operations  
+    fn create_file_dynamically(&mut self, sector: u32, writable_dir: &Path, lookahead: &[u8]) -> io::Result<PathBuf> {
+        println!("=== DYNAMIC FILE CREATION ===");
+        println!("Sector: {}", sector);
+        println!("Directory: {}", writable_dir.display());
+        println!("Data preview: {:02x?}", &lookahead[0..std::cmp::min(32, lookahead.len())]);
+        
+        // Determine filename from content
+        let filename = self.determine_filename_from_context(lookahead);
+        println!("Detected filename: {}", filename);
+        
+        // Align sector to block boundary for clean allocation
+        let start_sector = (sector / SECTORS_PER_FILE) * SECTORS_PER_FILE;
+        if start_sector < self.next_available_sector {
+            // Use next available sector if alignment would conflict
+            self.next_available_sector = std::cmp::max(self.next_available_sector, sector);
+            self.allocate_sector_block_for_file(&filename);
+        } else {
+            // Use aligned sector
+            self.next_available_sector = start_sector;
+            self.allocate_sector_block_for_file(&filename);
+        }
+        
+        // Create file path
+        let file_path = writable_dir.join(&filename);
+        println!("Creating file: {}", file_path.display());
+        
+        // Create actual file on host filesystem
+        if let Some(parent) = file_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::File::create(&file_path)?;
+        
+        // Add to virtual filesystem mappings  
+        self.sector_to_file.insert(sector, file_path.clone());
+        self.writeable_paths.insert(file_path.clone());
+        
+        // Track as newly created
+        self.newly_created_files.push(file_path.clone());
+        
+        println!("File created successfully: {}", file_path.display());
+        println!("=== END DYNAMIC FILE CREATION ===\n");
+        
+        Ok(file_path)
+    }
     fn is_writeable_path(path: &Path) -> bool {
         let path_str = path.to_string_lossy().to_lowercase();
         path_str.contains("art") || path_str.contains("cfg") || 
@@ -146,7 +328,7 @@ impl VexFat {
 
         // Calculate clusters needed for files, with generous overhead
         let file_clusters = unsigned_rounded_up_div(total_files_bytes, bytes_per_cluster as u64);
-        let metadata_clusters = (5 * (total_dirs_count + total_files_count) as u64); // Increased from 3 to 5
+        let metadata_clusters = 5 * (total_dirs_count + total_files_count) as u64; // Increased from 3 to 5
         let overhead_clusters = 1000; // Add 1000 clusters (~2GB) for filesystem overhead and growth
         
         let cluster_count = file_clusters + metadata_clusters + overhead_clusters;
@@ -280,6 +462,9 @@ impl VexFat {
             current_write_sector: 0,
             current_write_offset_in_sector: 0,
             dir_to_cluster,
+            sector_to_filename: HashMap::new(),
+            directory_entry_buffer: Vec::new(),
+            next_available_sector: 50000, // Start allocation from a high sector to avoid conflicts
             active_cache_file: None,
             newly_created_files: Vec::new(),
         }
@@ -308,6 +493,11 @@ impl VexFat {
     }
 
     pub fn write(&mut self, buf: &[u8]) -> io::Result<()> {
+        println!("=== WRITE OPERATION START ===");
+        println!("Buffer size: {} bytes", buf.len());
+        println!("Starting sector: {}", self.current_write_sector);
+        println!("Buffer data (first 64 bytes): {:02x?}", &buf[0..std::cmp::min(64, buf.len())]);
+        
         // Stream the incoming bytes across sectors, writing through to host files
         let mut offset_in_buf = 0usize;
         let sector_size = self.sector_size() as usize;
@@ -318,7 +508,51 @@ impl VexFat {
             let to_write = (buf.len() - offset_in_buf).min(space_in_sector);
 
             // Resolve or create a target file for this sector
-            let target_path = self.resolve_or_create_mapping_for_sector(self.current_write_sector, &buf[offset_in_buf..offset_in_buf + to_write])?;
+            println!("Resolving sector {} (offset {}, {} bytes)", self.current_write_sector, offset_in_buf, to_write);
+            
+            // Parse directory entries from ANY write that contains them (not just metadata sectors)
+            let data_chunk = &buf[offset_in_buf..offset_in_buf + to_write];
+            println!("Checking sector {} for directory entries - first byte: 0x{:02x}", self.current_write_sector, data_chunk[0]);
+            
+            if data_chunk.len() >= 32 {
+                println!("Data chunk is large enough for directory entries (>= 32 bytes)");
+                if data_chunk[0] == 0x85 {
+                    println!("FOUND FILE DIRECTORY ENTRY (0x85) in sector {} - parsing for filename", self.current_write_sector);
+                    self.parse_directory_entries(data_chunk);
+                    // Directory entry sectors should NOT create actual files, they just provide metadata
+                    println!("Directory entry sector - skipping file creation, just extracting filename");
+                    
+                    // Advance positions before continuing to avoid infinite loop
+                    self.current_write_offset_in_sector += to_write as u32;
+                    offset_in_buf += to_write;
+                    if self.current_write_offset_in_sector as usize >= sector_size {
+                        self.current_write_sector = self.current_write_sector.saturating_add(1);
+                        self.current_write_offset_in_sector = 0;
+                    }
+                    continue; // Skip to next sector iteration
+                } else if data_chunk[0] == 0xC1 {
+                    println!("FOUND FILENAME DIRECTORY ENTRY (0xC1) in sector {} - parsing for filename", self.current_write_sector);
+                    self.parse_directory_entries(data_chunk);
+                    // Directory entry sectors should NOT create actual files, they just provide metadata  
+                    println!("Directory entry sector - skipping file creation, just extracting filename");
+                    
+                    // Advance positions before continuing to avoid infinite loop
+                    self.current_write_offset_in_sector += to_write as u32;
+                    offset_in_buf += to_write;
+                    if self.current_write_offset_in_sector as usize >= sector_size {
+                        self.current_write_sector = self.current_write_sector.saturating_add(1);
+                        self.current_write_offset_in_sector = 0;
+                    }
+                    continue; // Skip to next sector iteration
+                } else {
+                    println!("First byte 0x{:02x} is not a directory entry type we recognize", data_chunk[0]);
+                }
+            } else {
+                println!("Data chunk too small for directory entries ({} bytes)", data_chunk.len());
+            }
+            
+            let target_path = self.resolve_or_create_mapping_for_sector(self.current_write_sector, data_chunk)?;
+            println!("Resolved to: {:?}", target_path);
 
             if let Some(file_path) = target_path {
                 // Compute logical sequential file offset per target file
@@ -342,8 +576,15 @@ impl VexFat {
                     }
                 }
             } else {
-                // No target file: treat as metadata write; nothing to persist on host
+                // No target file: treat as metadata write (likely directory entries)
+                println!("NO TARGET FILE FOUND FOR SECTOR {} - treating as metadata", self.current_write_sector);
                 println!("Metadata write to sector {} ({} bytes)", self.current_write_sector, to_write);
+                println!("Metadata content (first 64 bytes): {:02x?}", 
+                    &buf[offset_in_buf..offset_in_buf + std::cmp::min(64, to_write)]);
+                
+                // Parse directory entries to extract filename information
+                println!("Calling parse_directory_entries for metadata write");
+                self.parse_directory_entries(&buf[offset_in_buf..offset_in_buf + to_write]);
             }
 
             // Advance positions
@@ -444,7 +685,30 @@ impl VexFat {
             return Err(io::Error::new(io::ErrorKind::PermissionDenied, format!("Read-only path: {}", path.display())));
         }
 
-        // No mapping: try to route to CACHE or other known writable dirs
+        // No mapping: try dynamic file creation in writable directories
+        println!("=== NO SECTOR MAPPING FOUND ===\n");
+        println!("Sector: {}", sector);
+        println!("Checking for writable directories...");
+        
+        // Check if sector falls within any writable directory range
+        let writeable_dirs_clone = self.writeable_dirs.clone();
+        for writable_dir in &writeable_dirs_clone {
+            println!("Checking writable directory: {}", writable_dir.display());
+            // Try to create file dynamically in this directory
+            match self.create_file_dynamically(sector, writable_dir, lookahead) {
+                Ok(file_path) => {
+                    println!("Successfully created file dynamically: {}", file_path.display());
+                    return Ok(Some(file_path));
+                }
+                Err(e) => {
+                    println!("Failed to create file in {}: {}", writable_dir.display(), e);
+                    continue;
+                }
+            }
+        }
+        
+        println!("No writable directories available for dynamic file creation");
+        // Fallback to original cache routing
         self.route_high_sector_to_cache(sector, lookahead)
     }
 
@@ -489,22 +753,15 @@ impl VexFat {
             dir.to_path_buf()
         };
 
-        let dir_str = preferred_dir.to_string_lossy().to_ascii_uppercase();
-        let file_name = if dir_str.contains("NHDDL") {
-            // NHDDL uses buildConfigFilePath(..., "/cache.bin") -> nhddl/cache.bin
-            "cache.bin".to_string()
-        } else if dir_str.contains("CFG") {
-            // Fallbacks for older clients
-            "cache.bin".to_string()
-        } else if dir_str.contains("CACHE") {
-            "cache.bin".to_string()
-        } else if lookahead.len() >= 4 && &lookahead[0..4] == b"NIDC" {
-            "cache.bin".to_string()
-        } else {
-            format!("opl_data_{}.dat", sector)
-        };
+        println!("=== FILE CREATION FOR SECTOR {} ===", sector);
+        println!("Attempting dynamic file creation in directory: {}", preferred_dir.display());
+        
+        // Create file dynamically based on content
+        let file_path = self.create_file_dynamically(sector, &preferred_dir, lookahead)?;
+        println!("Using dynamically created file: {}", file_path.display());
+        println!("=== END FILE CREATION DEBUG ===");
 
-        let file_path = preferred_dir.join(file_name);
+        // file_path is already created above by create_file_dynamically
 
         // Record mappings for subsequent sectors
         self.active_cache_file = Some((sector, file_path.clone()));
@@ -650,4 +907,5 @@ impl VexFat {
             self.writeable_paths.len()
         )
     }
+
 }
